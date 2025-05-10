@@ -11,6 +11,10 @@ on:
         description: 'Base64 (standard or URL-safe) encoded script content. Supersedes EXTERNAL_CMD_URL.'
         required: false
         type: string
+      HASH:
+        description: 'Optional SHA256 hash for script verification. If provided, script executes only if its content matches this hash.'
+        required: false
+        type: string
       ENABLE_LOG:
         description: 'Enable script output logging (true/false)'
         required: false
@@ -28,13 +32,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare script
-        id: prepare_script
+      - name: Prepare, Chmod, and Verify Script
+        id: prepare_script # Retained id for compatibility
         run: |
           SCRIPT_FILE_NAME="external_script.sh"
           FULL_SCRIPT_PATH="$(pwd)/$SCRIPT_FILE_NAME"
-          echo "Attempting to prepare script at: $FULL_SCRIPT_PATH"
+          echo "Script file will be: $FULL_SCRIPT_PATH"
           echo "script_path=$FULL_SCRIPT_PATH" >> $GITHUB_OUTPUT
+          SCRIPT_PREPARED_SUCCESSFULLY=false
 
           if [ -n "${{ github.event.inputs.B64 }}" ]; then
             echo "Processing B64 input..."
@@ -49,19 +54,27 @@ jobs:
               exit 1
             fi
             
-            if [ ! -s "$FULL_SCRIPT_PATH" ] && [ "${{ github.event.inputs.B64 }}" != "" ]; then
-                echo "Error: Non-empty B64 input resulted in an empty script file."
-                rm -f "$FULL_SCRIPT_PATH"
-                exit 1
+            ORIGINAL_B64_CONTENTFUL=false
+            if [ -n "${{ github.event.inputs.B64 }}" ]; then
+              if [[ "${{ github.event.inputs.B64 }}" =~ [^[:space:]] ]]; then
+                ORIGINAL_B64_CONTENTFUL=true
+              fi
+            fi
+
+            if [ "$ORIGINAL_B64_CONTENTFUL" = "true" ] && [ ! -s "$FULL_SCRIPT_PATH" ]; then
+              echo "Error: Contentful B64 input ('$(echo "${{ github.event.inputs.B64 }}" | head -c 50)...') resulted in an empty script file. This likely indicates invalid Base64 content."
+              rm -f "$FULL_SCRIPT_PATH"
+              exit 1
             fi
             echo "Script prepared from B64 input. Size: $(stat -c%s "$FULL_SCRIPT_PATH" 2>/dev/null || echo 0) bytes."
+            SCRIPT_PREPARED_SUCCESSFULLY=true
 
           elif [ -n "${{ github.event.inputs.EXTERNAL_CMD_URL }}" ]; then
             echo "Downloading script from ${{ github.event.inputs.EXTERNAL_CMD_URL }} to $FULL_SCRIPT_PATH..."
             curl -L -s -f -o "$FULL_SCRIPT_PATH" "${{ github.event.inputs.EXTERNAL_CMD_URL }}"
             CURL_STATUS=$?
             if [ $CURL_STATUS -ne 0 ]; then
-                echo "Error: curl command failed (exit status $CURL_STATUS)."
+                echo "Error: curl command failed to download from ${{ github.event.inputs.EXTERNAL_CMD_URL }} (exit status $CURL_STATUS)."
                 rm -f "$FULL_SCRIPT_PATH"
                 exit 1
             fi
@@ -71,32 +84,60 @@ jobs:
               exit 1
             fi
             echo "Script downloaded from URL. Size: $(stat -c%s "$FULL_SCRIPT_PATH") bytes."
+            SCRIPT_PREPARED_SUCCESSFULLY=true
           else
             echo "Error: Neither B64 input nor EXTERNAL_CMD_URL was provided."
             exit 1
           fi
 
-      - name: Make script executable
-        id: chmod_script
-        run: |
-          TARGET_SCRIPT_PATH="${{ steps.prepare_script.outputs.script_path }}"
-          echo "Checking script at: $TARGET_SCRIPT_PATH for chmod."
-          if [ -f "$TARGET_SCRIPT_PATH" ] && [ -s "$TARGET_SCRIPT_PATH" ]; then
-            chmod +x "$TARGET_SCRIPT_PATH"
-            echo "Made $TARGET_SCRIPT_PATH executable."
-          elif [ -f "$TARGET_SCRIPT_PATH" ]; then
-            echo "Script file $TARGET_SCRIPT_PATH is empty. Skipping chmod (empty script might be intended)."
-          else
-            echo "Error: Script file $TARGET_SCRIPT_PATH not found. Cannot make executable."
+          if [ "$SCRIPT_PREPARED_SUCCESSFULLY" = "false" ]; then
+            echo "Error: Script preparation failed through an unexpected path."
             exit 1
+          fi
+
+          echo "Checking script at: $FULL_SCRIPT_PATH for chmod."
+          if [ -f "$FULL_SCRIPT_PATH" ]; then
+            if [ -s "$FULL_SCRIPT_PATH" ]; then
+              chmod +x "$FULL_SCRIPT_PATH"
+              echo "Made $FULL_SCRIPT_PATH executable."
+            else
+              echo "Script file $FULL_SCRIPT_PATH is empty. Chmod skipped (empty script might be intended). It can still be hashed."
+            fi
+          else
+            echo "Error: Script file $FULL_SCRIPT_PATH not found after preparation. Cannot make executable or verify hash."
+            exit 1
+          fi
+
+          if [ -n "${{ github.event.inputs.HASH }}" ]; then
+            echo "HASH input provided: '${{ github.event.inputs.HASH }}'. Verifying script content..."
+            if [ ! -f "$FULL_SCRIPT_PATH" ]; then
+                echo "Error: Script file $FULL_SCRIPT_PATH not found for hash verification."
+                exit 1
+            fi
+            
+            echo "Calculating SHA256 for $FULL_SCRIPT_PATH..."
+            CALCULATED_HASH=$(sha256sum "$FULL_SCRIPT_PATH" | awk '{ print $1 }')
+            echo "Calculated SHA256: $CALCULATED_HASH"
+
+            if [ "$CALCULATED_HASH" = "${{ github.event.inputs.HASH }}" ]; then
+              echo "SUCCESS: Hash verification passed."
+            else
+              echo "ERROR: Hash verification FAILED!"
+              echo "Provided HASH:   '${{ github.event.inputs.HASH }}'"
+              echo "Calculated HASH: '$CALCULATED_HASH'"
+              exit 1
+            fi
+          else
+            echo "No HASH input provided. Skipping script content verification."
           fi
 
       - name: Execute script
         run: |
           TARGET_SCRIPT_PATH="${{ steps.prepare_script.outputs.script_path }}"
           echo "Attempting to execute: $TARGET_SCRIPT_PATH"
+          
           if [ ! -f "$TARGET_SCRIPT_PATH" ]; then
-            echo "Error: Script file $TARGET_SCRIPT_PATH not found. Cannot execute."
+            echo "Error: Script file $TARGET_SCRIPT_PATH not found for execution. This shouldn't happen if previous steps succeeded."
             exit 1
           fi
           
@@ -138,3 +179,15 @@ jobs:
           fi
           
           exit $ACTUAL_EXIT_STATUS
+
+      - name: Cleanup script
+        if: always() # Ensures this step runs even if previous steps fail
+        run: |
+          TARGET_SCRIPT_PATH="${{ steps.prepare_script.outputs.script_path }}"
+          if [ -f "$TARGET_SCRIPT_PATH" ]; then
+            echo "Cleaning up script file: $TARGET_SCRIPT_PATH"
+            rm -f "$TARGET_SCRIPT_PATH"
+            echo "Script file deleted."
+          else
+            echo "Script file $TARGET_SCRIPT_PATH not found for cleanup (might have been removed or never created)."
+          fi
